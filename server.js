@@ -690,11 +690,7 @@ app.post("/api/check-availability", async (req, res) => {
       res.status(400).json({ error: "date und time_slot sind erforderlich (JJJJ-MM-TT / HH:MM)." });
       return;
     }
-    date = normalizeDate(date);
-    if (!date) {
-      res.status(400).json({ error: "date konnte nicht als gültiges Datum (JJJJ-MM-TT) erkannt werden." });
-      return;
-    }
+    date = normalizeDate(date) || date;
     const available = await isSlotAvailable(date, time_slot, service, tire_brought, tire_on_rims);
     res.json({ available });
   } catch (e) {
@@ -711,11 +707,7 @@ app.post("/api/create-booking", async (req, res) => {
       res.status(400).json({ error: "service, date, time_slot und customer_name sind erforderlich." });
       return;
     }
-    date = normalizeDate(date);
-    if (!date) {
-      res.status(400).json({ error: "date konnte nicht als gültiges Datum (JJJJ-MM-TT) erkannt werden." });
-      return;
-    }
+    date = normalizeDate(date) || date;
     const available = await isSlotAvailable(date, time_slot, service, tire_brought, tire_on_rims);
     if (!available) {
       res.status(409).json({ error: "Termin nicht verfügbar (belegt, außerhalb der Öffnungszeiten, oder Sa/So)." });
