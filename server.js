@@ -109,6 +109,21 @@ function intervalsOverlap(a, b) {
   return a.some(([as, ae]) => b.some(([bs, be]) => as < be && bs < ae));
 }
 
+// Nimmt tolerant verschiedene Datumsformate entgegen (z.B. volle ISO-Zeitstempel
+// von externen Agent-Plattformen wie ThunderPhone) und gibt immer sauberes
+// JJJJ-MM-TT zurück, oder null falls gar nichts Sinnvolles erkennbar ist.
+function normalizeDate(input) {
+  if (!input) return null;
+  const str = String(input).trim();
+  // Bereits sauber (JJJJ-MM-TT, ggf. mit Zeit/Zeitzone dahinter) — einfach die ersten 10 Zeichen nehmen.
+  const isoMatch = str.match(/^(\d{4}-\d{2}-\d{2})/);
+  if (isoMatch) return isoMatch[1];
+  // Fallback: irgendein anderes Format, das JS selbst parsen kann.
+  const parsed = new Date(str);
+  if (isNaN(parsed.getTime())) return null;
+  return new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Berlin" }).format(parsed); // JJJJ-MM-TT
+}
+
 async function isSlotAvailable(date, timeSlot, service, tireBrought, tireOnRims) {
   const dow = dayOfWeek(date);
   if (dow === 0 || dow === 6) return false; // Sa/So: für Telefon-Kunden nicht buchbar
@@ -164,13 +179,62 @@ async function insertBooking(booking, callSid) {
 
 // ---- E-Mail (Resend) --------------------------------------------------
 
-async function sendEmail(to, subject, html) {
+// Einheitliches Design für alle E-Mails: dunkler Header mit Logo, weiße Karte darunter.
+function emailWrapper(bodyHtml) {
+  return `
+  <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;background:#f4f4f4;padding:20px;">
+    <div style="background:#1B1D20;border-radius:12px 12px 0 0;padding:20px 24px;">
+      <span style="color:#35C078;font-size:20px;">⚡</span>
+      <span style="color:#fff;font-size:20px;font-weight:800;vertical-align:middle;">&nbsp;Terminfactory</span>
+    </div>
+    <div style="background:#fff;border-radius:0 0 12px 12px;padding:24px;border:1px solid #eee;border-top:none;">
+      ${bodyHtml}
+    </div>
+  </div>`;
+}
+
+function detailsTable(booking) {
+  const row = (label, value) => `<tr><td style="padding:8px 0;color:#888;width:100px;font-size:14px;">${label}</td><td style="padding:8px 0;font-weight:600;color:#1B1D20;font-size:14px;">${value}</td></tr>`;
+  return `<table style="width:100%;margin:16px 0;border-collapse:collapse;">
+    ${row("Leistung", escapeXml(booking.service || ""))}
+    ${row("Datum", booking.date)}
+    ${row("Uhrzeit", `${booking.time_slot} Uhr`)}
+  </table>`;
+}
+
+// Erstellt eine .ics-Kalenderdatei zum Anhängen — Kunde kann sie direkt öffnen,
+// der Termin landet automatisch im eigenen Kalender.
+function generateICS(booking) {
+  const [y, m, d] = booking.date.split("-").map(Number);
+  const [h, min] = booking.time_slot.split(":").map(Number);
+  const duration = durationForService(booking.service);
+  const start = new Date(y, m - 1, d, h, min);
+  const end = new Date(start.getTime() + duration * 60000);
+  const fmt = (dt) =>
+    `${dt.getFullYear()}${String(dt.getMonth() + 1).padStart(2, "0")}${String(dt.getDate()).padStart(2, "0")}T${String(dt.getHours()).padStart(2, "0")}${String(dt.getMinutes()).padStart(2, "0")}00`;
+  return [
+    "BEGIN:VCALENDAR",
+    "VERSION:2.0",
+    "PRODID:-//Terminfactory//DE",
+    "BEGIN:VEVENT",
+    `UID:${crypto.randomUUID()}@terminfactory`,
+    `DTSTAMP:${fmt(new Date())}`,
+    `DTSTART:${fmt(start)}`,
+    `DTEND:${fmt(end)}`,
+    `SUMMARY:${booking.service || "Termin"} - ${WORKSHOP_NAME}`,
+    `DESCRIPTION:Termin bei ${WORKSHOP_NAME}`,
+    "END:VEVENT",
+    "END:VCALENDAR",
+  ].join("\r\n");
+}
+
+async function sendEmail(to, subject, html, attachments) {
   if (!process.env.RESEND_API_KEY || !to) {
     console.warn("E-Mail nicht verschickt — RESEND_API_KEY fehlt oder keine Empfänger-Adresse vorhanden.");
     return;
   }
   try {
-    await fetch("https://api.resend.com/emails", {
+    const res = await fetch("https://api.resend.com/emails", {
       method: "POST",
       headers: { Authorization: `Bearer ${process.env.RESEND_API_KEY}`, "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -178,33 +242,53 @@ async function sendEmail(to, subject, html) {
         to,
         subject,
         html,
+        ...(attachments ? { attachments } : {}),
       }),
     });
+    if (!res.ok) {
+      const body = await res.text();
+      console.error(`Resend-Fehler (${res.status}) beim Senden an ${to}:`, body);
+    }
   } catch (e) {
     console.error("Fehler beim Versenden der E-Mail:", e.message);
   }
 }
 
 async function sendBookingReceivedEmail(booking) {
-  await sendEmail(
-    booking.customer_email,
-    `Terminanfrage eingegangen — ${WORKSHOP_NAME}`,
-    `<p>Guten Tag ${escapeXml(booking.customer_name || "")},</p>
-<p>vielen Dank für Ihre Terminanfrage bei ${WORKSHOP_NAME}:</p>
-<p><b>${escapeXml(booking.service || "")}</b> am <b>${booking.date}</b> um <b>${booking.time_slot} Uhr</b></p>
-<p>Ihre Anfrage wird von der Werkstatt geprüft. Sie erhalten in Kürze eine Rückmeldung, ob der Termin bestätigt werden kann.</p>`
-  );
+  const body = `
+    <div style="color:#E8A33D;font-size:18px;font-weight:700;margin-bottom:6px;">⏳ Anfrage eingegangen</div>
+    <p style="color:#555;margin-top:0;">Guten Tag ${escapeXml(booking.customer_name || "")}, vielen Dank für Ihre Terminanfrage bei ${WORKSHOP_NAME}.</p>
+    ${detailsTable(booking)}
+    <p style="color:#555;">Ihre Anfrage wird von der Werkstatt geprüft. Sie erhalten in Kürze eine Rückmeldung, ob der Termin bestätigt werden kann.</p>`;
+  await sendEmail(booking.customer_email, `🟠 Terminanfrage eingegangen — ${WORKSHOP_NAME}`, emailWrapper(body));
 }
 
 async function sendBookingDecisionEmail(booking, decision) {
   const isConfirmed = decision === "confirmed";
+  const body = isConfirmed
+    ? `
+    <div style="color:#2FA36B;font-size:18px;font-weight:700;margin-bottom:6px;">✅ Ihr Termin ist bestätigt!</div>
+    <p style="color:#555;margin-top:0;">Die Werkstatt hat Ihren Termin bestätigt.</p>
+    ${detailsTable(booking)}
+    <p style="color:#555;">Im Anhang finden Sie die Kalender-Datei — einfach öffnen und der Termin wird eingetragen.</p>
+    <div style="background:#eafaf0;padding:12px 16px;border-radius:8px;color:#2FA36B;font-size:14px;">📎 Termin als .ics Datei im Anhang</div>`
+    : `
+    <div style="color:#D64545;font-size:18px;font-weight:700;margin-bottom:6px;">❌ Termin nicht bestätigt</div>
+    <p style="color:#555;margin-top:0;">Leider konnte Ihr angefragter Termin nicht bestätigt werden.</p>
+    ${detailsTable(booking)}
+    <p style="color:#555;">Bitte kontaktieren Sie uns für einen alternativen Termin.</p>`;
+
+  let attachments;
+  if (isConfirmed) {
+    const ics = generateICS(booking);
+    attachments = [{ filename: "termin.ics", content: Buffer.from(ics).toString("base64") }];
+  }
+
   await sendEmail(
     booking.customer_email,
-    isConfirmed ? `Ihr Termin ist bestätigt — ${WORKSHOP_NAME}` : `Ihr Termin konnte leider nicht bestätigt werden — ${WORKSHOP_NAME}`,
-    `<p>Guten Tag ${escapeXml(booking.customer_name || "")},</p>
-${isConfirmed
-  ? `<p>Ihr Termin wurde bestätigt:</p><p><b>${escapeXml(booking.service || "")}</b> am <b>${booking.date}</b> um <b>${booking.time_slot} Uhr</b></p><p>Wir freuen uns auf Sie.</p>`
-  : `<p>Leider konnte Ihr angefragter Termin (<b>${escapeXml(booking.service || "")}</b> am <b>${booking.date}</b> um <b>${booking.time_slot} Uhr</b>) nicht bestätigt werden.</p><p>Bitte kontaktieren Sie uns für einen alternativen Termin.</p>`}`
+    isConfirmed ? `🟢 Ihr Termin ist bestätigt — ${WORKSHOP_NAME}` : `🔴 Ihr Termin konnte leider nicht bestätigt werden — ${WORKSHOP_NAME}`,
+    emailWrapper(body),
+    attachments
   );
 }
 
@@ -600,9 +684,15 @@ app.post("/api/booking-received", async (req, res) => {
 
 app.post("/api/check-availability", async (req, res) => {
   try {
-    const { date, time_slot, service, tire_brought, tire_on_rims } = req.body;
+    const { time_slot, service, tire_brought, tire_on_rims } = req.body;
+    let { date } = req.body;
     if (!date || !time_slot) {
       res.status(400).json({ error: "date und time_slot sind erforderlich (JJJJ-MM-TT / HH:MM)." });
+      return;
+    }
+    date = normalizeDate(date);
+    if (!date) {
+      res.status(400).json({ error: "date konnte nicht als gültiges Datum (JJJJ-MM-TT) erkannt werden." });
       return;
     }
     const available = await isSlotAvailable(date, time_slot, service, tire_brought, tire_on_rims);
@@ -615,9 +705,15 @@ app.post("/api/check-availability", async (req, res) => {
 
 app.post("/api/create-booking", async (req, res) => {
   try {
-    const { service, date, time_slot, customer_name, customer_email, customer_phone, kfz, tire_brought, tire_on_rims } = req.body;
+    const { service, time_slot, customer_name, customer_email, customer_phone, kfz, tire_brought, tire_on_rims } = req.body;
+    let { date } = req.body;
     if (!service || !date || !time_slot || !customer_name) {
       res.status(400).json({ error: "service, date, time_slot und customer_name sind erforderlich." });
+      return;
+    }
+    date = normalizeDate(date);
+    if (!date) {
+      res.status(400).json({ error: "date konnte nicht als gültiges Datum (JJJJ-MM-TT) erkannt werden." });
       return;
     }
     const available = await isSlotAvailable(date, time_slot, service, tire_brought, tire_on_rims);
@@ -716,9 +812,10 @@ app.post("/email/received", async (req, res) => {
     if (!extracted.complete) {
       await sendEmail(
         senderEmail,
-        `Noch ein paar Angaben fehlen — ${WORKSHOP_NAME}`,
-        `<p>Guten Tag,</p><p>vielen Dank für Ihre Terminanfrage bei ${WORKSHOP_NAME}.</p>
-<p>${escapeXml(extracted.missing || "Könnten Sie uns bitte Service, Wunschtermin, Namen und Kennzeichen mitteilen?")}</p>`
+        `🟠 Noch ein paar Angaben fehlen — ${WORKSHOP_NAME}`,
+        emailWrapper(`<div style="color:#E8A33D;font-size:18px;font-weight:700;margin-bottom:6px;">✉️ Noch ein paar Angaben</div>
+<p style="color:#555;margin-top:0;">Guten Tag, vielen Dank für Ihre Terminanfrage bei ${WORKSHOP_NAME}.</p>
+<p style="color:#555;">${escapeXml(extracted.missing || "Könnten Sie uns bitte Service, Wunschtermin, Namen und Kennzeichen mitteilen?")}</p>`)
       );
       return;
     }
@@ -727,10 +824,11 @@ app.post("/email/received", async (req, res) => {
     if (!free) {
       await sendEmail(
         senderEmail,
-        `Termin leider nicht verfügbar — ${WORKSHOP_NAME}`,
-        `<p>Guten Tag ${escapeXml(extracted.customer_name || "")},</p>
-<p>der gewünschte Termin (${escapeXml(extracted.service || "")} am ${extracted.date} um ${extracted.time_slot} Uhr) ist leider nicht mehr verfügbar oder liegt außerhalb unserer Öffnungszeiten (Mo-Fr).</p>
-<p>Bitte schlagen Sie uns gerne einen anderen Termin vor.</p>`
+        `🔴 Termin leider nicht verfügbar — ${WORKSHOP_NAME}`,
+        emailWrapper(`<div style="color:#D64545;font-size:18px;font-weight:700;margin-bottom:6px;">❌ Termin nicht verfügbar</div>
+<p style="color:#555;margin-top:0;">Guten Tag ${escapeXml(extracted.customer_name || "")},</p>
+${detailsTable(extracted)}
+<p style="color:#555;">Dieser Termin ist leider nicht mehr verfügbar oder liegt außerhalb unserer Öffnungszeiten (Mo-Fr). Bitte schlagen Sie uns gerne einen anderen Termin vor.</p>`)
       );
       return;
     }
